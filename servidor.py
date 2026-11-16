@@ -1,15 +1,13 @@
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify
 import os
 import smtplib
 import threading
-import time
-import uuid
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from supabase import create_client
 
 app = Flask(__name__)
-SERVER_API_VERSION = "6.1-INTEGRIDAD-DISTRIBUIDA"
+SERVER_API_VERSION = "6.0-INTEGRIDAD"
 
 # --- CONFIGURACIÓN DE SUPABASE ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
@@ -31,121 +29,15 @@ if SUPABASE_URL and SUPABASE_KEY:
 
 # --- MEMORIA LOCAL EXCLUSIVA PARA SESIONES ACTIVAS ---
 sesiones_activas = {}
-operaciones_lock = threading.RLock()
+operaciones_lock = threading.Lock()
 
-# Bloqueo distribuido compartido por TODAS las instancias Render.
-# Requiere crear las funciones SQL incluidas en el archivo SQL complementario.
-POS_LOCK_NAME = "pos_operaciones_global"
-POS_LOCK_LEASE_SECONDS = 180
-POS_LOCK_WAIT_SECONDS = 12
-POS_LOCK_RENEW_SECONDS = 30
-
-# --- BLOQUEO DISTRIBUIDO SUPABASE (COMPARTIDO ENTRE RENDER 1 Y RENDER 2) ---
-def _rpc_bool(response):
-    """Interpreta respuestas booleanas de PostgREST/Supabase sin asumir un formato único."""
-    data = getattr(response, "data", response)
-    if isinstance(data, bool):
-        return data
-    if isinstance(data, list) and data:
-        first = data[0]
-        if isinstance(first, bool):
-            return first
-        if isinstance(first, dict):
-            return next((v for v in first.values() if isinstance(v, bool)), False)
-    if isinstance(data, dict):
-        return next((v for v in data.values() if isinstance(v, bool)), False)
-    return False
-
-def _rpc_lock(function_name, owner_id):
-    if not supabase:
-        raise RuntimeError("Supabase no está conectado; se bloqueó la modificación para proteger los datos")
-    response = supabase.rpc(function_name, {
-        "p_lock_name": POS_LOCK_NAME,
-        "p_owner_id": owner_id,
-        "p_lease_seconds": POS_LOCK_LEASE_SECONDS,
-    }).execute()
-    return _rpc_bool(response)
-
-def _renovar_bloqueo(owner_id, detener):
-    """Renueva la concesión mientras una petición modificadora sigue trabajando."""
-    while not detener.wait(POS_LOCK_RENEW_SECONDS):
-        try:
-            if not _rpc_lock("pos_renovar_bloqueo", owner_id):
-                app.logger.error("No se pudo renovar el bloqueo distribuido %s", owner_id)
-                return
-        except Exception:
-            app.logger.exception("Error renovando el bloqueo distribuido")
-            return
-
-@app.before_request
-def adquirir_bloqueo_para_escrituras():
-    """Serializa escrituras de todas las instancias; GET y prueba SMTP no bloquean."""
-    if request.method not in ("POST", "PUT", "PATCH", "DELETE") or request.path == "/correo/prueba":
-        return None
-    if not supabase:
-        return jsonify({"error": "Supabase no está disponible. La modificación fue detenida para proteger los datos."}), 503
-    if not operaciones_lock.acquire(timeout=POS_LOCK_WAIT_SECONDS):
-        return jsonify({"error": "El servidor está ocupado procesando otra operación. Intenta nuevamente."}), 503
-    owner_id = uuid.uuid4().hex
-    try:
-        limite = time.monotonic() + POS_LOCK_WAIT_SECONDS
-        adquirido = False
-        while time.monotonic() < limite:
-            if _rpc_lock("pos_adquirir_bloqueo", owner_id):
-                adquirido = True
-                break
-            time.sleep(0.25)
-        if not adquirido:
-            operaciones_lock.release()
-            return jsonify({"error": "Otra caja está procesando una operación. No se modificaron los datos; vuelve a intentar."}), 503
-        detener = threading.Event()
-        renovador = threading.Thread(target=_renovar_bloqueo, args=(owner_id, detener), daemon=True)
-        g.pos_lock_owner = owner_id
-        g.pos_lock_stop = detener
-        g.pos_lock_thread = renovador
-        renovador.start()
-        return None
-    except Exception as e:
-        operaciones_lock.release()
-        app.logger.exception("No se pudo adquirir el bloqueo distribuido")
-        return jsonify({"error": "No se pudo asegurar el bloqueo compartido en Supabase. Operación cancelada.", "detalle": str(e)}), 503
-
-@app.after_request
-def liberar_bloqueo_para_escrituras(response):
-    owner_id = getattr(g, "pos_lock_owner", None)
-    if owner_id:
-        detener = getattr(g, "pos_lock_stop", None)
-        if detener:
-            detener.set()
-        try:
-            supabase.rpc("pos_liberar_bloqueo", {
-                "p_lock_name": POS_LOCK_NAME,
-                "p_owner_id": owner_id,
-            }).execute()
-        except Exception:
-            app.logger.exception("No se pudo liberar el bloqueo; expirará automáticamente")
-        finally:
-            operaciones_lock.release()
-    return response
-
-# Versión compartida del catálogo. No debe vivir solo en la memoria de un Render.
+# Version ligera del catalogo: permite saber si cambio sin descargar todos los productos.
 catalogo_version = 1
-
-def obtener_catalogo_version_compartida():
-    try:
-        valor = leer_json("server_catalogo_version", 1)
-        return max(1, int(valor))
-    except Exception:
-        return max(1, int(catalogo_version))
 
 def marcar_catalogo_cambiado():
     global catalogo_version
-    actual = obtener_catalogo_version_compartida()
-    nueva = actual + 1
-    if not guardar_json("server_catalogo_version", nueva):
-        app.logger.error("No se pudo actualizar server_catalogo_version; se conserva versión local")
-    catalogo_version = nueva
-    return nueva
+    catalogo_version += 1
+    return catalogo_version
 
 
 # --- FUNCIONES AUXILIARES DE PERSISTENCIA EN SUPABASE ---
@@ -340,149 +232,127 @@ def manejar_usuarios():
         usuarios = leer_json("server_usuarios", usuarios_default)
         return jsonify(usuarios), 200
 
-# --- CONTROL DE SESIONES COMPARTIDO ENTRE TODAS LAS INSTANCIAS RENDER ---
-# La memoria local de cada proceso no sirve en modo activo-activo: una caja
-# puede iniciar sesión en Render A y consultar/cerrar sesión en Render B.
-# Por eso el estado de las sesiones se guarda en app_storage de Supabase.
-def _leer_sesiones_compartidas():
-    sesiones = leer_json("server_sesiones_activas", {})
-    return sesiones if isinstance(sesiones, dict) else {}
-
-
+# --- CONTROL DE SESIONES ACTIVAS (En memoria local de Render) ---
 @app.route('/sesiones/verificar', methods=['GET'])
 def verificar_sesion():
     usuario = request.args.get("usuario", "")
-    sesiones = _leer_sesiones_compartidas()
-    return jsonify({"activo": bool(sesiones.get(usuario, False))}), 200
-
+    activo = sesiones_activas.get(usuario, False)
+    return jsonify({"activo": activo}), 200
 
 @app.route('/sesiones/iniciar', methods=['POST'])
 def iniciar_sesion():
-    data = request.json or {}
-    usuario = str(data.get("usuario", "")).strip()
-    if not usuario:
-        return jsonify({"error": "Usuario no especificado"}), 400
-
-    sesiones = _leer_sesiones_compartidas()
-    sesiones[usuario] = True
-    if not guardar_json("server_sesiones_activas", sesiones):
-        return jsonify({"error": "No se pudo registrar la sesión compartida en Supabase."}), 503
-    sesiones_activas[usuario] = True  # Caché local solo informativa.
-    return jsonify({"status": "success", "shared": True}), 200
-
+    data = request.json
+    usuario = data.get("usuario")
+    if usuario:
+        sesiones_activas[usuario] = True
+        return jsonify({"status": "success"}), 200
+    return jsonify({"error": "Usuario no especificado"}), 400
 
 @app.route('/sesiones/cerrar', methods=['POST'])
 def cerrar_sesion():
     data = request.json or {}
-    usuario = str(data.get("usuario", "")).strip()
-    datos_cierre = data.get("datos_cierre", {})
+    usuario = data.get("usuario")
+    datos_cierre = data.get("datos_cierre", {}) # Totales enviados desde la caja al cerrar
+    
     if not usuario:
         return jsonify({"error": "Usuario no especificado"}), 400
 
-    sesiones = _leer_sesiones_compartidas()
-    sesiones[usuario] = False
+    # 1. Marcar siempre como inactivo en memoria local
     sesiones_activas[usuario] = False
-    if not guardar_json("server_sesiones_activas", sesiones):
-        return jsonify({"error": "No se pudo actualizar el estado de sesión en Supabase."}), 503
 
-    # El administrador no forma parte del cierre consolidado de cajas.
+    # Si es Administrador, cerramos de inmediato sin procesar cola de cajas de cobro
     if "admin" in usuario.lower() or usuario.lower() == "administrador":
         return jsonify({"status": "success", "message": "Sesión de administrador cerrada"}), 200
 
+    # 2. Guardar o actualizar el cierre parcial de esta caja en Supabase (REPOSO)
     cierres_actuales = leer_json("server_cierres_turno", [])
-    if not isinstance(cierres_actuales, list):
-        cierres_actuales = []
     cierres_actuales = [c for c in cierres_actuales if c.get("usuario") != usuario]
-    datos_cierre = dict(datos_cierre) if isinstance(datos_cierre, dict) else {}
     datos_cierre["usuario"] = usuario
     cierres_actuales.append(datos_cierre)
-    if not guardar_json("server_cierres_turno", cierres_actuales):
-        return jsonify({"error": "No se pudo guardar el cierre de caja en Supabase."}), 503
+    guardar_json("server_cierres_turno", cierres_actuales)
 
-    cajas_activas_restantes = sum(
-        1 for usr, activo in sesiones.items()
-        if activo and "admin" not in str(usr).lower()
-    )
+    # 3. Contar cuántas cajas (excluyendo al administrador) siguen activas en memoria
+    cajas_activas_restantes = 0
+    for usr, activo in sesiones_activas.items():
+        is_usr_admin = "admin" in usr.lower() or usr.lower() == "administrador"
+        if activo and not is_usr_admin:
+            cajas_activas_restantes += 1
 
+    # 4. Validar si aún faltan cajas por cerrar
     if cajas_activas_restantes > 0:
         return jsonify({
-            "status": "success",
+            "status": "success", 
             "message": f"Cierre de {usuario} en reposo en la nube. Faltan {cajas_activas_restantes} caja(s) por cerrar."
         }), 200
+    else:
+        # ¡TODAS LAS CAJAS HAN CERRADO! Procesar correos individuales y consolidado.
+        config = leer_json("server_config", {})
+        correo_dest = config.get("correo_destino", "")
+        correo_emisor = config.get("correo_emisor", "")
+        pass_emisor = config.get("pass_emisor", "")
 
-    # Todas las cajas cerraron: enviar reportes individuales y consolidado.
-    config = leer_json("server_config", {})
-    correo_dest = config.get("correo_destino", "")
-    correo_emisor = config.get("correo_emisor", "")
-    pass_emisor = config.get("pass_emisor", "")
+        if correo_dest and correo_emisor and pass_emisor:
+            total_general_pto = 0
+            total_general_pago_movil = 0
+            total_general_biopago = 0
+            total_general_efectivo = 0
+            total_general_divisas = 0
+            total_general_general = 0
+            
+            cuerpo_total_consolidado = "--- RESUMEN CONSOLIDADO GENERAL DE CIERRE DE TODAS LAS CAJAS ---\n\n"
 
-    if correo_dest and correo_emisor and pass_emisor:
-        total_general_pto = 0
-        total_general_pago_movil = 0
-        total_general_biopago = 0
-        total_general_efectivo = 0
-        total_general_divisas = 0
-        total_general_general = 0
-        cuerpo_total_consolidado = "--- RESUMEN CONSOLIDADO GENERAL DE CIERRE DE TODAS LAS CAJAS ---\n\n"
+            # A. Enviar el correo individual de cada caja en reposo
+            for cierre in cierres_actuales:
+                caja_nombre = cierre.get("usuario", "Caja")
+                
+                monto_pto = float(cierre.get("total_punto", cierre.get("punto_venta", 0)))
+                monto_pago_movil = float(cierre.get("total_pago_movil", cierre.get("pago_movil", 0)))
+                monto_biopago = float(cierre.get("total_biopago", cierre.get("biopago", 0)))
+                monto_efectivo = float(cierre.get("total_efectivo", cierre.get("efectivo", 0)))
+                monto_divisas = float(cierre.get("total_divisas", cierre.get("divisas", 0)))
+                monto_total = float(cierre.get("total_venta", cierre.get("total_general", cierre.get("total_dolares", 0))))
+                
+                total_general_pto += monto_pto
+                total_general_pago_movil += monto_pago_movil
+                total_general_biopago += monto_biopago
+                total_general_efectivo += monto_efectivo
+                total_general_divisas += monto_divisas
+                total_general_general += monto_total
 
-        for cierre in cierres_actuales:
-            caja_nombre = cierre.get("usuario", "Caja")
-            monto_pto = float(cierre.get("total_punto", cierre.get("punto_venta", 0)))
-            monto_pago_movil = float(cierre.get("total_pago_movil", cierre.get("pago_movil", 0)))
-            monto_biopago = float(cierre.get("total_biopago", cierre.get("biopago", 0)))
-            monto_efectivo = float(cierre.get("total_efectivo", cierre.get("efectivo", 0)))
-            monto_divisas = float(cierre.get("total_divisas", cierre.get("divisas", 0)))
-            monto_total = float(cierre.get("total_venta", cierre.get("total_general", cierre.get("total_dolares", 0))))
+                cuerpo_individual = f"Reporte de Cierre de Caja\n"
+                cuerpo_individual += f"Cajero / Caja: {caja_nombre}\n"
+                cuerpo_individual += f"- Punto de Venta: {monto_pto}\n"
+                cuerpo_individual += f"- Pago Móvil: {monto_pago_movil}\n"
+                cuerpo_individual += f"- Biopago: {monto_biopago}\n"
+                cuerpo_individual += f"- Efectivo: {monto_efectivo}\n"
+                cuerpo_individual += f"- Divisas: {monto_divisas}\n"
+                cuerpo_individual += f"TOTAL CAJA: {monto_total}\n"
 
-            total_general_pto += monto_pto
-            total_general_pago_movil += monto_pago_movil
-            total_general_biopago += monto_biopago
-            total_general_efectivo += monto_efectivo
-            total_general_divisas += monto_divisas
-            total_general_general += monto_total
+                enviar_correo_smtp(correo_dest, correo_emisor, pass_emisor, f"Cierre de Turno - {caja_nombre}", cuerpo_individual)
 
-            cuerpo_individual = (
-                "Reporte de Cierre de Caja\n"
-                f"Cajero / Caja: {caja_nombre}\n"
-                f"- Punto de Venta: {monto_pto}\n"
-                f"- Pago Móvil: {monto_pago_movil}\n"
-                f"- Biopago: {monto_biopago}\n"
-                f"- Efectivo: {monto_efectivo}\n"
-                f"- Divisas: {monto_divisas}\n"
-                f"TOTAL CAJA: {monto_total}\n"
-            )
-            enviar_correo_smtp(
-                correo_dest, correo_emisor, pass_emisor,
-                f"Cierre de Turno - {caja_nombre}", cuerpo_individual
-            )
-            cuerpo_total_consolidado += (
-                f"• {caja_nombre} -> Punto: {monto_pto} | Pago Móvil: "
-                f"{monto_pago_movil} | Biopago: {monto_biopago} | Total: {monto_total}\n"
-            )
+                cuerpo_total_consolidado += f"• {caja_nombre} -> Punto: {monto_pto} | Pago Móvil: {monto_pago_movil} | Biopago: {monto_biopago} | Total: {monto_total}\n"
 
-        cuerpo_total_consolidado += "\n----------------------------------------\n"
-        cuerpo_total_consolidado += f"GRAN TOTAL PUNTO DE VENTA: {total_general_pto}\n"
-        cuerpo_total_consolidado += f"GRAN TOTAL PAGO MÓVIL: {total_general_pago_movil}\n"
-        cuerpo_total_consolidado += f"GRAN TOTAL BIOPAGO: {total_general_biopago}\n"
-        cuerpo_total_consolidado += f"GRAN TOTAL EFECTIVO: {total_general_efectivo}\n"
-        cuerpo_total_consolidado += f"GRAN TOTAL DIVISAS: {total_general_divisas}\n"
-        cuerpo_total_consolidado += "----------------------------------------\n"
-        cuerpo_total_consolidado += f"GRAN TOTAL GENERAL DE LA JORNADA: {total_general_general}\n"
-        enviar_correo_smtp(
-            correo_dest, correo_emisor, pass_emisor,
-            "Consolidado Total de Cierres de Caja", cuerpo_total_consolidado
-        )
+            # B. Agregar sumatoria total general al consolidado
+            cuerpo_total_consolidado += f"\n----------------------------------------\n"
+            cuerpo_total_consolidado += f"GRAN TOTAL PUNTO DE VENTA: {total_general_pto}\n"
+            cuerpo_total_consolidado += f"GRAN TOTAL PAGO MÓVIL: {total_general_pago_movil}\n"
+            cuerpo_total_consolidado += f"GRAN TOTAL BIOPAGO: {total_general_biopago}\n"
+            cuerpo_total_consolidado += f"GRAN TOTAL EFECTIVO: {total_general_efectivo}\n"
+            cuerpo_total_consolidado += f"GRAN TOTAL DIVISAS: {total_general_divisas}\n"
+            cuerpo_total_consolidado += f"----------------------------------------\n"
+            cuerpo_total_consolidado += f"GRAN TOTAL GENERAL DE LA JORNADA: {total_general_general}\n"
 
-    if not guardar_json("server_cierres_turno", []):
-        return jsonify({"error": "Los correos se procesaron, pero no se pudo limpiar el cierre temporal."}), 503
-    if not guardar_json("server_sesiones_activas", {}):
-        return jsonify({"error": "Los cierres se procesaron, pero no se pudo limpiar el estado de sesiones."}), 503
-    sesiones_activas.clear()
+            # C. Enviar correo consolidado final
+            enviar_correo_smtp(correo_dest, correo_emisor, pass_emisor, "Consolidado Total de Cierres de Caja", cuerpo_total_consolidado)
 
-    return jsonify({
-        "status": "success",
-        "message": "Todas las cajas cerradas. Reportes individuales y consolidado procesados."
-    }), 200
+        # 5. Limpiar los cierres temporales en la nube y vaciar sesiones locales
+        guardar_json("server_cierres_turno", [])
+        sesiones_activas.clear()
+
+        return jsonify({
+            "status": "success", 
+            "message": "Todas las cajas cerradas. Correos individuales en reposo y consolidado total enviados con éxito."
+        }), 200
 
 # --- RUTAS DE PRODUCTOS ---
 def _normalizar_codigo(valor):
@@ -583,8 +453,7 @@ def _buscar_producto(productos, producto_id="", codigo=""):
 
 @app.route('/catalogo/version', methods=['GET'])
 def obtener_version_catalogo():
-    version = obtener_catalogo_version_compartida()
-    return jsonify({"catalogo_version": version}), 200
+    return jsonify({"catalogo_version": catalogo_version}), 200
 
 @app.route('/integridad/catalogo', methods=['GET'])
 def integridad_catalogo():
