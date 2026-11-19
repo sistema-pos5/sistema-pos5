@@ -155,6 +155,16 @@ def enviar_correo_smtp(destinatario, emisor, password, asunto, cuerpo):
         print(f"Error enviando correo: {e}")
         return False
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    if not supabase:
+        return jsonify({"ok": False, "supabase": False}), 503
+    try:
+        supabase.table("app_storage").select("Key").limit(1).execute()
+        return jsonify({"ok": True, "supabase": True}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "supabase": False, "error": str(e)}), 503
+
 # --- RUTAS DE CONFIGURACIÓN ---
 @app.route('/configuracion', methods=['GET', 'POST'])
 def manejar_configuracion():
@@ -164,7 +174,10 @@ def manejar_configuracion():
         "correo_destino": os.environ.get("CORREO_DESTINO", ""),
         "correo_emisor": os.environ.get("CORREO_EMISOR", ""),
         "pass_emisor": os.environ.get("PASS_EMISOR", ""),
-        "actualizar_tasa_auto": "Sí"
+        "actualizar_tasa_auto": "Sí",
+        "url_servidor_respaldo": "",
+        "modo_servidor": "Automatico",
+        "servidor_seleccionado": "1"
     }
     if request.method == 'POST':
         data = request.json
